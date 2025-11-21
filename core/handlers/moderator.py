@@ -58,69 +58,81 @@ async def handle_moderator_answer(message: Message, store: Storage, album: list[
 async def send_moderator_answer(message: Message, store: Storage, album: list[Message] | None, ticket_id: int, answer: str):
     ticket = await store.ticket(ticket_id)
     reply_to_id = None
-    album_messages: list[Message] | None = None
     try:
         replied_message = await store.message_id(message.reply_to_message.message_id)
         reply_to_id = replied_message.owner_message_id
     except MessageNotFoundException:
-        logger.info(f"Message {reply_to_id} to reply not found")
+        logger.info("Message to reply not found")
 
-    sent: list[Message]
-    # Если документ
-    if  message.content_type == ContentType.DOCUMENT:
-        # Если одиночный документ
-        if message.media_group_id  is None:
-            file_id = message.document.file_id
-            sent = [await bot.send_document(ticket.owner_chat_id,
-                                            document=file_id,
-                                            reply_to_message_id=reply_to_id,
-                                            parse_mode=ParseMode.HTML,
-                                            caption=texts.ticket.moderator_answer(ticket_id, answer))]
-        else:
-            album_messages = album or [message]
-            media = []
-            for idx, obj in enumerate(album_messages):
-                media.append(
-                    InputMediaDocument(
-                        media=obj.document.file_id,
-                        caption=texts.ticket.moderator_answer(ticket.id, answer) if idx == 0 else None,
-                        parse_mode=ParseMode.HTML if idx == 0 else None,
-                    )
-                )
-            sent = await bot.send_media_group(chat_id=ticket.owner_chat_id, media=media, reply_to_message_id=reply_to_id)
-    # Если фото
-    elif message.content_type == ContentType.PHOTO:
-        # если одиночное фото
+    album_messages = album or ([message] if message.media_group_id else None)
+
+    async def send_document():
         if message.media_group_id is None:
-            file_id = message.photo[-1].file_id
-            sent = [await bot.send_photo(ticket.owner_chat_id, photo=file_id,
-                                                    reply_to_message_id=reply_to_id,
-                                                    parse_mode=ParseMode.HTML,
-                                                    caption=texts.ticket.moderator_answer(ticket.id, answer))]
-        else:
-            album_messages = album or [message]
-            media = [InputMediaPhoto(media=album_messages[0].photo[-1].file_id,
-                                                 caption=texts.ticket.moderator_answer(ticket.id, answer),
-                                                 parse_mode=ParseMode.HTML)]
-            for obj in album_messages[1:]:
-                file_id = obj.photo[-1].file_id
-                media.append(InputMediaPhoto(media=file_id))
-            sent = await bot.send_media_group(chat_id=ticket.owner_chat_id, media=media, reply_to_message_id=reply_to_id)
-    # Если текстовое сообщение
-    elif message.content_type == ContentType.TEXT:
-        sent = [await bot.send_message(
+            return [await bot.send_document(
+                ticket.owner_chat_id,
+                document=message.document.file_id,
+                reply_to_message_id=reply_to_id,
+                parse_mode=ParseMode.HTML,
+                caption=texts.ticket.moderator_answer(ticket_id, answer),
+            )], None
+
+        group = album_messages or [message]
+        media = [
+            InputMediaDocument(
+                media=obj.document.file_id,
+                caption=texts.ticket.moderator_answer(ticket.id, answer) if idx == 0 else None,
+                parse_mode=ParseMode.HTML if idx == 0 else None,
+            )
+            for idx, obj in enumerate(group)
+        ]
+        sent_documents = await bot.send_media_group(
+            chat_id=ticket.owner_chat_id,
+            media=media,
+            reply_to_message_id=reply_to_id,
+        )
+        return sent_documents, group
+
+    async def send_photo():
+        if message.media_group_id is None:
+            return [await bot.send_photo(
+                ticket.owner_chat_id,
+                photo=message.photo[-1].file_id,
+                reply_to_message_id=reply_to_id,
+                parse_mode=ParseMode.HTML,
+                caption=texts.ticket.moderator_answer(ticket.id, answer),
+            )], None
+
+        group = album_messages or [message]
+        media = [
+            InputMediaPhoto(
+                media=obj.photo[-1].file_id,
+                caption=texts.ticket.moderator_answer(ticket.id, answer) if idx == 0 else None,
+                parse_mode=ParseMode.HTML if idx == 0 else None,
+            )
+            for idx, obj in enumerate(group)
+        ]
+        sent_photos = await bot.send_media_group(
+            chat_id=ticket.owner_chat_id,
+            media=media,
+            reply_to_message_id=reply_to_id,
+        )
+        return sent_photos, group
+
+    async def send_text():
+        sent_message = await bot.send_message(
             ticket.owner_chat_id,
             texts.ticket.moderator_answer(ticket.id, answer),
             reply_to_message_id=reply_to_id,
             parse_mode=ParseMode.HTML,
-        )]
-    # Любые другие типы (видео, голосовые и пр.)
-    else:
-        target_album = album or [message]
-        sent = []
+        )
+        return [sent_message], None
+
+    async def send_other():
+        target_album = album_messages or [message]
+        sent_messages = []
         for idx, obj in enumerate(target_album):
             caption = texts.ticket.moderator_answer(ticket.id, answer) if idx == 0 else None
-            sent.append(
+            sent_messages.append(
                 await obj.copy_to(
                     ticket.owner_chat_id,
                     reply_to_message_id=reply_to_id,
@@ -128,13 +140,22 @@ async def send_moderator_answer(message: Message, store: Storage, album: list[Me
                     parse_mode=ParseMode.HTML if caption else None,
                 )
             )
+        return sent_messages, target_album
 
-    await ticket.change_status(Status.IN_PROGRESS) # Обновление статуса
+    senders = {
+        ContentType.DOCUMENT: send_document,
+        ContentType.PHOTO: send_photo,
+        ContentType.TEXT: send_text,
+    }
+    send_handler = senders.get(message.content_type, send_other)
+    sent, saved_album = await send_handler()
+
+    await ticket.change_status(Status.IN_PROGRESS)
     ticket = await store.update_ticket(ticket.id, status=ticket.status)
     await update_ticket_message(ticket)
 
     if message.media_group_id and len(sent) > 1:
-        album_messages = album or album_messages
+        album_messages = saved_album or album_messages
         if not album_messages or len(album_messages) != len(sent):
             logger.warning("Album messages are missing or do not match sent group size; using primary message id as fallback")
 
